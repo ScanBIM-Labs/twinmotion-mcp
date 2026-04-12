@@ -1,0 +1,8 @@
+{
+  "name": "twinmotion-mcp",
+  "version": "1.0.0",
+  "description": "Twinmotion MCP — Rendering pipeline, asset management, video export via APS",
+  "main": "src/index.js",
+  "author": "ScanBIM Labs LLC",
+  "license": "MIT"
+}
