@@ -151,68 +151,195 @@ async function getObjectTree(token, urn, guid) {
 const TOOLS = [
   {
     name: "tm_import_rvt",
-    description: "Import a Revit model for visualization — uploads to APS OSS and starts SVF2 translation with thumbnail generation",
+    description: [
+      "Import a Revit/BIM model into the Twinmotion visualization pipeline: downloads the source file from a public URL, uploads it to an APS OSS transient bucket, and kicks off an SVF2 + thumbnail translation job. Returns the base64 URN (project_id) used by every other tm_* tool.",
+      "",
+      "When to use: when a user wants to prepare a Revit (.rvt), IFC (.ifc), or other BIM/CAD model for real-time visualization in Unreal Engine / Twinmotion — typically the first step before rendering stills, defining scenes, or exporting FBX/glTF/OBJ geometry for a UE import. Also use when you need thumbnails or view metadata from a source file that has not yet been translated by APS.",
+      "When NOT to use: not for MEP clash review (use navisworks-mcp), not for quantity takeoff or cost estimation (use qto-mcp), not for Twinmotion presets editing — Twinmotion itself has no public REST API, so scene/material authoring must happen manually in the UE editor after FBX/USD export.",
+      "APS scopes required: data:read data:write data:create bucket:read bucket:create viewables:read. Uses Model Derivative API (translation) + OSS (upload). Twinmotion has no public REST API; all automation is APS Model Derivative + manual Unreal Engine export.",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; large .rvt/.nwd/.ifc files are often multi-GB and translation can take 5–60 min — poll the manifest with exponential backoff (start 5s, cap 60s) rather than retrying this tool. Worker request ceiling is ~100MB body; extremely large files may need signed-URL upload instead.",
+      "Errors: 401 = APS token failed (check APS_CLIENT_ID/APS_CLIENT_SECRET, re-auth); 403 = scope missing (bucket:create/data:write not granted — have user re-consent); 404 = file_url unreachable; 409 = bucket key collision (rare — retry, tool uses timestamp); 413/507 = file too large for worker memory (advise signed-URL upload); 422 = unsupported source format (only Autodesk-accepted types: rvt, ifc, nwd, dwg, dgn, 3dm, stp, etc.); 429 = back off 60s before retrying; 5xx = APS upstream outage, retry with backoff.",
+      "Side effects: CREATES a new transient OSS bucket (scanbim-viz-<timestamp>, auto-expires in 24h), CREATES an object in OSS, STARTS a translation job consuming APS cloud credits. NOT idempotent — each call creates a new bucket + URN. Writes a row to usage_log D1 table."
+    ].join("\n"),
     inputSchema: {
       type: "object",
       properties: {
-        file_url: { type: "string", description: "Public URL to download the Revit file" },
-        file_name: { type: "string", description: "File name (e.g. 'Building.rvt')" },
-        include_materials: { type: "boolean", description: "Include material data in translation" },
-        lighting_preset: { type: "string", enum: ["default", "natural", "studio", "evening"], description: "Scene lighting preset label" }
+        file_url: {
+          type: "string",
+          description: "Public HTTPS URL to download the source BIM/CAD file. Must be reachable without auth from Cloudflare Workers egress. Supports rvt, ifc, nwd, dwg, dgn, 3dm, stp, obj, and other APS-supported formats. Signed URLs (S3/GCS) work if the signature is embedded in the query string.",
+          examples: [
+            "https://example-cdn.com/projects/office-tower.rvt",
+            "https://storage.googleapis.com/bim-uploads/site-model.ifc?X-Goog-Signature=..."
+          ]
+        },
+        file_name: {
+          type: "string",
+          description: "Filename with extension used as the OSS object key. Non-alphanumeric characters are sanitized to underscores. Extension drives APS translator selection (.rvt → Revit, .ifc → IFC, etc.). For downstream Twinmotion/UE import, keep the base name meaningful (e.g. 'TowerA_L01-L20.rvt' → later exported as TowerA_L01-L20.fbx / .glb / .usd).",
+          examples: ["Building.rvt", "SitePlan.ifc", "Factory_v3.nwd", "Terrain.dwg"]
+        },
+        include_materials: {
+          type: "boolean",
+          description: "If true (default), the translation preserves material/texture data so the derivative is visually meaningful in Twinmotion/UE. Set false only for geometry-only pipelines (faster, smaller derivatives).",
+          examples: [true, false]
+        },
+        lighting_preset: {
+          type: "string",
+          enum: ["default", "natural", "studio", "evening"],
+          description: "Lighting preset label stored alongside the import — purely metadata for downstream tm_render_image / UE scene setup; does not affect the APS translation itself. 'natural' = daylight sun+sky, 'studio' = neutral 3-point, 'evening' = warm low sun.",
+          examples: ["natural", "studio"]
+        }
       },
       required: ["file_url", "file_name"]
     }
   },
   {
     name: "tm_set_environment",
-    description: "Configure visualization environment settings — stores scene config and retrieves model metadata for context",
+    description: [
+      "Configure the visualization environment (weather, time-of-day, surround context) for a previously imported model. Validates the model exists via APS Model Derivative manifest, then stores the environment config in KV (24h TTL) so tm_render_image and tm_export_video can apply it.",
+      "",
+      "When to use: after tm_import_rvt completes and the manifest status is 'success' (or in-progress if you just want to pre-stage config), when the user wants to set scene context — e.g. 'render the tower at 17:00 in an urban setting with clear weather' — before generating images or video walkthroughs. Typical step 2 in the Twinmotion flow.",
+      "When NOT to use: not for editing geometry, materials, or UE post-process volumes (those live in the Unreal Engine editor after FBX/USD import — Twinmotion has no public REST API). Do not call before tm_import_rvt — there is no URN to attach config to.",
+      "APS scopes required: viewables:read data:read (manifest + metadata fetch only — read-only for this tool). No bucket or write scopes needed.",
+      "Rate limits: APS default ~50 req/min per app per endpoint; manifest/metadata are cheap but polling-heavy if the model is still translating — prefer a single call per user intent, not a status-poll loop. KV writes are effectively unlimited at this scale.",
+      "Errors: 401 = APS token expired/invalid; 403 = viewables:read not granted; 404 = URN unknown to APS (wrong project_id, or translation never started); 409 = n/a; 422 = n/a; 429 = back off 30s; 5xx = APS Model Derivative outage.",
+      "Side effects: WRITES the env config to KV under key env_config_<urn> (TTL 86400s). Idempotent — calling again overwrites the prior config. Writes a row to usage_log."
+    ].join("\n"),
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string", description: "Base64-encoded URN of the translated model" },
-        environment: { type: "string", enum: ["urban", "suburban", "natural", "industrial", "custom"], description: "Environment preset" },
-        weather: { type: "string", enum: ["clear", "cloudy", "rainy", "sunset", "night"], description: "Weather condition" },
-        time_of_day: { type: "string", description: "Time of day (e.g. '14:30')" }
+        project_id: {
+          type: "string",
+          description: "Base64-URL-safe URN returned by tm_import_rvt (the `project_id` / `urn` field). This is the Autodesk design URN — NOT an object ID, NOT a bucket key. Format: base64url of 'urn:adsk.objects:os.object:<bucket>/<object>', trailing '=' stripped.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS12aXotMTcwMDAwMDAwMC9CdWlsZGluZy5ydnQ"]
+        },
+        environment: {
+          type: "string",
+          enum: ["urban", "suburban", "natural", "industrial", "custom"],
+          description: "Surround/context preset for the UE scene. Purely metadata — applied when the operator builds the Twinmotion scene post-FBX-export. 'custom' means the user will supply their own HDRI/backdrop in UE.",
+          examples: ["urban", "natural"]
+        },
+        weather: {
+          type: "string",
+          enum: ["clear", "cloudy", "rainy", "sunset", "night"],
+          description: "Weather condition label stored with the scene config. Drives UE sky/atmosphere presets during manual Twinmotion scene authoring.",
+          examples: ["clear", "sunset"]
+        },
+        time_of_day: {
+          type: "string",
+          description: "24-hour clock time as HH:MM. Used for sun position in the UE scene. Default if omitted is '12:00' (noon).",
+          examples: ["08:30", "14:30", "17:45"]
+        }
       },
       required: ["project_id"]
     }
   },
   {
     name: "tm_render_image",
-    description: "Render a still image — generates thumbnail from APS Model Derivative at specified resolution",
+    description: [
+      "Render a still preview image of the model at a specified resolution by pulling the APS Model Derivative thumbnail (capped at 800x800 by the APS endpoint). Also resolves the camera_preset against model metadata to identify which 3D view it maps to, and applies any stored environment config from tm_set_environment for reference.",
+      "",
+      "When to use: when you need a quick visual sanity-check of an imported model (e.g. 'show me what Tower A looks like'), to preview a specific named view before committing to a full UE/Twinmotion render, or to embed a low-res preview in a chat/report. Pair with tm_list_scenes first to discover valid view names/GUIDs.",
+      "When NOT to use: not for production-quality renders (APS thumbnails are low-res and raster-only; for cinematic output use Unreal Engine Movie Render Queue after FBX/USD export), not for arbitrary custom camera angles (only named views from the source file are resolvable — there is no runtime camera placement API here), not for 2D sheet exports (use tm_list_scenes to find 2D roles and fetch directly).",
+      "APS scopes required: viewables:read data:read. Hits Model Derivative thumbnail + metadata endpoints only.",
+      "Rate limits: APS default ~50 req/min per app per endpoint. Thumbnail endpoint is usually fast (<2s) once the model has translated; if called while status='inprogress' it returns no thumbnail. Do not loop-poll this tool — poll the manifest via tm_set_environment or tm_list_scenes instead.",
+      "Errors: 401/403 = token/scope; 404 = URN not found or thumbnail not yet generated (model still translating — retry after manifest reports success); 409 = n/a; 422 = n/a; 429 = back off 30s; 5xx = APS upstream.",
+      "Side effects: NONE (read-only on APS). Reads KV env_config_<urn>. Writes a row to usage_log. Idempotent."
+    ].join("\n"),
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string", description: "Base64-encoded URN" },
-        camera_preset: { type: "string", description: "View name or GUID to render from" },
-        resolution: { type: "string", enum: ["400x400", "800x800", "1920x1080"], description: "Output resolution" },
-        quality: { type: "string", enum: ["draft", "standard", "high", "cinematic"], description: "Render quality" }
+        project_id: {
+          type: "string",
+          description: "Base64-URL-safe URN of the translated model (from tm_import_rvt). Model must have reached manifest.status='success' or at least have a thumbnail derivative available.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS12aXotMTcwMDAwMDAwMC9CdWlsZGluZy5ydnQ"]
+        },
+        camera_preset: {
+          type: "string",
+          description: "View name (e.g. '3D View 1', '{3D}', 'Perspective - Lobby') or metadata GUID to render from. Discover valid values via tm_list_scenes. If omitted or unmatched, the first 3D view is used. Custom ad-hoc camera placements are not supported — only views baked into the source file.",
+          examples: ["{3D}", "Perspective - Exterior", "a4b1c5d2-7e8f-4a3b-9c1d-2e3f4a5b6c7d"]
+        },
+        resolution: {
+          type: "string",
+          enum: ["400x400", "800x800", "1920x1080"],
+          description: "Requested output resolution. Note: APS thumbnail endpoint hard-caps at 800x800 — selecting 1920x1080 will be clamped to 800x800. For true HD/4K renders, export FBX/USD and render in UE Movie Render Queue.",
+          examples: ["400x400", "800x800"]
+        },
+        quality: {
+          type: "string",
+          enum: ["draft", "standard", "high", "cinematic"],
+          description: "Quality label — metadata only, since APS thumbnails have fixed quality. Use 'cinematic' as an intent signal that the operator should do a post-export UE render instead.",
+          examples: ["standard", "cinematic"]
+        }
       },
       required: ["project_id"]
     }
   },
   {
     name: "tm_export_video",
-    description: "Start a rendering job for animated visualization — translates model with additional output formats",
+    description: [
+      "Prepare a model for an animated walkthrough / video export by verifying the manifest is complete, then starting a secondary Model Derivative job that produces OBJ geometry (suitable for ingestion into offline rendering pipelines, Blender, or Unreal Engine). Also returns the list of available named views so the operator can stitch them into a camera path. Does NOT itself produce an mp4 — video encoding happens in the downstream UE/Twinmotion pipeline.",
+      "",
+      "When to use: when a user wants a walkthrough/flythrough video of a BIM model (e.g. 'make a 30-second tour of Tower A') — this tool gets the geometry into a UE-ingestible form (.obj, plus suggests FBX/glTF/USD naming like TowerA_walkthrough.fbx for the exported asset) and enumerates named views to guide camera path authoring.",
+      "When NOT to use: not to actually encode video (no runtime renderer in this worker — output must be finished in Unreal/Twinmotion/Blender), not before tm_import_rvt, not if the manifest is still 'inprogress' (the tool will short-circuit and return status='pending'). Not for still images (use tm_render_image) or clash animations (use navisworks-mcp).",
+      "APS scopes required: data:read data:write viewables:read. Write scopes are needed because this kicks off a new Model Derivative translation job (OBJ + thumbnail).",
+      "Rate limits: APS default ~50 req/min; Model Derivative translation jobs ~60 req/min. OBJ derivatives of large BIM models can be multi-GB and take 10–45 min — rely on manifest polling with exponential backoff, not re-calling this tool.",
+      "Errors: 401/403 = token/scope (data:write commonly missing); 404 = URN not found; 409 = OBJ derivative already queued (treat as success); 422 = input format does not support OBJ output (some IFC variants / proprietary formats — fall back to FBX/glTF via a different derivative format); 429 = back off 60s; 5xx = APS upstream.",
+      "Side effects: STARTS a new translation job on an existing URN (consumes APS cloud credits). Writes usage_log. NOT idempotent per-call (each call creates a new job record), but APS will dedupe identical output requests internally if manifest already contains the derivative."
+    ].join("\n"),
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string", description: "Base64-encoded URN" },
-        animation_name: { type: "string", description: "Label for this animation/walkthrough" },
-        duration_seconds: { type: "number", description: "Target duration" },
-        format: { type: "string", enum: ["mp4", "mov", "webm"], description: "Output video format" },
-        resolution: { type: "string", enum: ["1920x1080", "3840x2160"], description: "Output resolution" }
+        project_id: {
+          type: "string",
+          description: "Base64-URL-safe URN of a fully-translated model (manifest.status must equal 'success'). If status != success, the tool returns status='pending' without starting a job.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS12aXotMTcwMDAwMDAwMC9CdWlsZGluZy5ydnQ"]
+        },
+        animation_name: {
+          type: "string",
+          description: "Human-readable label for the walkthrough/animation (used in downstream asset naming; suggest matching the exported video/USD filename base, e.g. 'tower_a_lobby_tour' → tower_a_lobby_tour.mp4 / .fbx / .glb / .usd).",
+          examples: ["tower_a_lobby_tour", "site_flythrough_v2", "client_presentation_evening"]
+        },
+        duration_seconds: {
+          type: "number",
+          description: "Target duration of the final video in seconds (integer). Used only as metadata for the downstream UE Movie Render Queue; this tool does not encode video. Typical: 15–120s.",
+          examples: [15, 30, 60, 120]
+        },
+        format: {
+          type: "string",
+          enum: ["mp4", "mov", "webm"],
+          description: "Intended final video container (metadata hint for the downstream UE/Twinmotion render step). mp4 = H.264 web-friendly, mov = ProRes for editing, webm = VP9/AV1 for web.",
+          examples: ["mp4", "mov"]
+        },
+        resolution: {
+          type: "string",
+          enum: ["1920x1080", "3840x2160"],
+          description: "Intended final video resolution (metadata hint). 4K (3840x2160) roughly quadruples UE render time vs 1080p.",
+          examples: ["1920x1080", "3840x2160"]
+        }
       },
       required: ["project_id", "animation_name"]
     }
   },
   {
     name: "tm_list_scenes",
-    description: "List all available views, scenes, and model structure from a translated model",
+    description: [
+      "Enumerate every 2D/3D view ('scene') baked into the translated model, plus a shallow dump of the model object tree (first 50 top-level nodes across all 3D views), plus the list of completed derivatives (svf2, thumbnail, obj, etc.) available via APS. The canonical discovery tool for anything downstream that needs a view name or GUID.",
+      "",
+      "When to use: before tm_render_image (to pick a valid camera_preset), before tm_export_video (to plan a camera path across named views), to audit what was translated ('did the 3D coordination view survive translation?'), or to expose the top-level model hierarchy for UI display. Also a useful health check — if scene_count=0, the translation is incomplete or failed.",
+      "When NOT to use: not for full property queries on individual objects (this tool returns names + GUIDs + child counts only — use a dedicated property-query tool for full attribute dumps), not for geometry data (use tm_export_video for OBJ export), not on a URN that has not yet started translating.",
+      "APS scopes required: viewables:read data:read. Read-only across Model Derivative manifest + metadata + object-tree endpoints.",
+      "Rate limits: APS default ~50 req/min. This tool fans out across every 3D view to fetch object trees — for models with many 3D views (10+) it can burn a chunk of the budget in one call. Prefer caching the result on the caller side rather than re-invoking.",
+      "Errors: 401/403 = token/scope; 404 = URN not found; 422 = n/a; 429 = back off 60s (this tool makes multiple APS calls per invocation, so 429 is more likely than on single-call tools); 5xx = APS upstream. A 202 on object-tree means APS is still building the tree — the tool retries once internally.",
+      "Side effects: NONE on APS (read-only). Writes a usage_log row. Idempotent."
+    ].join("\n"),
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string", description: "Base64-encoded URN" }
+        project_id: {
+          type: "string",
+          description: "Base64-URL-safe URN of the translated model. Should have manifest.status='success' for full results; if still translating, scene_count may be 0 or partial.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS12aXotMTcwMDAwMDAwMC9CdWlsZGluZy5ydnQ"]
+        }
       },
       required: ["project_id"]
     }
